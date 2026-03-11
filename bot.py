@@ -7,222 +7,308 @@ import tempfile
 import aiohttp
 import subprocess
 from pathlib import Path
-import os
+
 TOKEN = os.environ.get("DISCORD_TOKEN")
+
+STREAMABLE_USER = os.environ.get("STREAMABLE_USER")
+STREAMABLE_PASS = os.environ.get("STREAMABLE_PASS")
 
 intents = discord.Intents.default()
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 TEMP = Path(tempfile.gettempdir()) / "discord_video_bot"
 TEMP.mkdir(exist_ok=True)
 
-MAX_UPLOAD_MB = 25  # Discord free tier limit
+MAX_UPLOAD_MB = 25
 
 
-# ── helpers ────────────────────────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────
 
 def ffmpeg(*args, capture=True):
     cmd = ["ffmpeg", "-y", *[str(a) for a in args]]
     result = subprocess.run(cmd, capture_output=capture, text=True)
+
     if result.returncode != 0 and capture:
         raise RuntimeError(result.stderr[-800:])
+
     return result
 
 
 async def download(url: str, dest: Path, session: aiohttp.ClientSession):
     async with session.get(url) as r:
         r.raise_for_status()
+
         with open(dest, "wb") as f:
-            async for chunk in r.content.iter_chunked(1 << 16):
+            async for chunk in r.content.iter_chunked(65536):
                 f.write(chunk)
 
 
-def size_mb(path: Path) -> float:
+def size_mb(path: Path):
     return path.stat().st_size / 1_048_576
 
 
+# ── streamable upload ───────────────────────────────
+
+async def upload_streamable(path: Path):
+    url = "https://api.streamable.com/upload"
+
+    auth = aiohttp.BasicAuth(STREAMABLE_USER, STREAMABLE_PASS)
+
+    async with aiohttp.ClientSession(auth=auth) as session:
+        data = aiohttp.FormData()
+        data.add_field("file", open(path, "rb"), filename=path.name)
+
+        async with session.post(url, data=data) as r:
+            res = await r.json()
+
+    if "shortcode" not in res:
+        raise RuntimeError(res)
+
+    return f"https://streamable.com/{res['shortcode']}"
+
+
+# ── send file or streamable ─────────────────────────
+
 async def send_file(ctx_or_interaction, path: Path, label: str):
+
     mb = size_mb(path)
+
     if mb > MAX_UPLOAD_MB:
-        msg = f"⚠️ Output is **{mb:.1f} MB** — over Discord's {MAX_UPLOAD_MB} MB limit. Try a shorter clip."
+
+        try:
+            url = await upload_streamable(path)
+
+            msg = (
+                f"📦 File too large for Discord (**{mb:.1f} MB**)\n"
+                f"🔗 Uploaded to Streamable:\n{url}"
+            )
+
+        except Exception as e:
+            msg = f"❌ Streamable upload failed:\n{e}"
+
         if isinstance(ctx_or_interaction, discord.Interaction):
             await ctx_or_interaction.followup.send(msg)
         else:
             await ctx_or_interaction.reply(msg)
+
         return
 
     file = discord.File(str(path), filename=path.name)
+
     if isinstance(ctx_or_interaction, discord.Interaction):
-        await ctx_or_interaction.followup.send(f"✅ {label}", file=file)
+        await ctx_or_interaction.followup.send(label, file=file)
     else:
-        await ctx_or_interaction.reply(f"✅ {label}", file=file)
+        await ctx_or_interaction.reply(label, file=file)
 
 
-# ── slash commands ─────────────────────────────────────────────────────────────
+# ── trim command ────────────────────────────────────
 
-@tree.command(name="trim", description="Trim a video clip. Attach the video and specify start/end in seconds.")
-@app_commands.describe(
-    start="Start time in seconds (e.g. 5)",
-    end="End time in seconds (e.g. 30)",
-)
-async def trim_cmd(interaction: discord.Interaction, start: float, end: float):
-    await interaction.response.defer(thinking=True)
-
-    attachments = interaction.message.attachments if interaction.message else []
-    # Slash commands don't carry attachments; user must run !trim instead
-    await interaction.followup.send(
-        "⚠️ Slash commands can't receive attachments directly.\n"
-        "Please use: `!trim <start> <end>` and **attach your video** to that message."
-    )
-
-
-@bot.command(name="trim", help="Trim a video. Usage: !trim <start_sec> <end_sec>  (attach video)")
+@bot.command(name="trim")
 async def trim_prefix(ctx, start: float, end: float):
+
     if not ctx.message.attachments:
-        return await ctx.reply("❌ Please attach a video file.")
+        return await ctx.reply("❌ Please attach a video.")
 
     att = ctx.message.attachments[0]
+
     async with ctx.typing():
+
         async with aiohttp.ClientSession() as session:
             inp = TEMP / f"in_{ctx.message.id}{Path(att.filename).suffix}"
             out = TEMP / f"trim_{ctx.message.id}.mp4"
+
             await download(att.url, inp, session)
 
         dur = end - start
+
         if dur <= 0:
-            return await ctx.reply("❌ End time must be greater than start time.")
+            return await ctx.reply("❌ End must be greater than start.")
 
         try:
-            ffmpeg("-ss", start, "-i", inp, "-t", dur,
-                   "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", out)
+            ffmpeg(
+                "-ss", start,
+                "-i", inp,
+                "-t", dur,
+                "-c:v", "libx264",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                out
+            )
+
         except RuntimeError as e:
             return await ctx.reply(f"❌ FFmpeg error:\n```{e}```")
 
-        await send_file(ctx, out, f"Trimmed {start}s → {end}s")
+        await send_file(ctx, out, f"✅ Trimmed {start}s → {end}s")
+
         inp.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
 
 
-@bot.command(name="merge", help="Merge 2–5 videos. Attach all videos in one message.")
+# ── merge command ───────────────────────────────────
+
+@bot.command(name="merge")
 async def merge_cmd(ctx):
+
     atts = ctx.message.attachments
+
     if len(atts) < 2:
-        return await ctx.reply("❌ Please attach **at least 2** video files.")
+        return await ctx.reply("❌ Attach at least 2 videos.")
+
     if len(atts) > 5:
-        return await ctx.reply("❌ Max 5 videos at once.")
+        return await ctx.reply("❌ Max 5 videos.")
 
     async with ctx.typing():
+
         async with aiohttp.ClientSession() as session:
+
             paths = []
+
             for i, att in enumerate(atts):
                 p = TEMP / f"merge_{ctx.message.id}_{i}{Path(att.filename).suffix}"
+
                 await download(att.url, p, session)
                 paths.append(p)
 
-        # Re-encode all to same format then concat
         reencoded = []
+
         for i, p in enumerate(paths):
+
             re = TEMP / f"re_{ctx.message.id}_{i}.mp4"
+
             try:
-                ffmpeg("-i", p, "-c:v", "libx264", "-c:a", "aac",
-                       "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-                       re)
+
+                ffmpeg(
+                    "-i", p,
+                    "-c:v", "libx264",
+                    "-c:a", "aac",
+                    "-vf",
+                    "scale=1280:720:force_original_aspect_ratio=decrease,"
+                    "pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+                    re
+                )
+
             except RuntimeError as e:
-                return await ctx.reply(f"❌ Error processing clip {i+1}:\n```{e}```")
+                return await ctx.reply(f"❌ Error clip {i+1}:\n```{e}```")
+
             reencoded.append(re)
 
         list_file = TEMP / f"list_{ctx.message.id}.txt"
+
         list_file.write_text("\n".join(f"file '{p}'" for p in reencoded))
 
         out = TEMP / f"merged_{ctx.message.id}.mp4"
+
         try:
-            ffmpeg("-f", "concat", "-safe", "0", "-i", list_file,
-                   "-c", "copy", out)
+            ffmpeg("-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", out)
+
         except RuntimeError as e:
             return await ctx.reply(f"❌ Merge error:\n```{e}```")
 
-        await send_file(ctx, out, f"Merged {len(atts)} clips!")
+        await send_file(ctx, out, f"✅ Merged {len(atts)} clips")
 
         for p in paths + reencoded:
             p.unlink(missing_ok=True)
+
         list_file.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
 
 
-@bot.command(name="addmusic", help="Add music to a video. First attachment = video, second = audio.")
+# ── add music command ───────────────────────────────
+
+@bot.command(name="addmusic")
 async def addmusic_cmd(ctx, volume: float = 0.5):
+
     atts = ctx.message.attachments
+
     if len(atts) < 2:
-        return await ctx.reply(
-            "❌ Attach **2 files**: first the video, then the audio track.\n"
-            f"Optional: specify volume 0.0–1.0 (default 0.5). E.g. `!addmusic 0.3`"
-        )
+        return await ctx.reply("❌ Attach video then audio.")
 
     async with ctx.typing():
+
         async with aiohttp.ClientSession() as session:
-            vid_path = TEMP / f"vid_{ctx.message.id}{Path(atts[0].filename).suffix}"
-            aud_path = TEMP / f"aud_{ctx.message.id}{Path(atts[1].filename).suffix}"
-            await download(atts[0].url, vid_path, session)
-            await download(atts[1].url, aud_path, session)
+
+            vid = TEMP / f"vid_{ctx.message.id}{Path(atts[0].filename).suffix}"
+            aud = TEMP / f"aud_{ctx.message.id}{Path(atts[1].filename).suffix}"
+
+            await download(atts[0].url, vid, session)
+            await download(atts[1].url, aud, session)
 
         out = TEMP / f"music_{ctx.message.id}.mp4"
+
         vol = max(0.0, min(1.0, volume))
 
         try:
-            # Mix original audio (quieter) with new music, loop music if shorter than video
+
             ffmpeg(
-                "-i", vid_path,
-                "-stream_loop", "-1", "-i", aud_path,
+                "-i", vid,
+                "-stream_loop", "-1",
+                "-i", aud,
                 "-filter_complex",
-                f"[0:a]volume=0.4[orig];[1:a]volume={vol}[music];[orig][music]amix=inputs=2:duration=first[aout]",
+                f"[0:a]volume=0.4[orig];[1:a]volume={vol}[music];"
+                f"[orig][music]amix=inputs=2:duration=first[aout]",
                 "-map", "0:v",
                 "-map", "[aout]",
                 "-c:v", "libx264",
                 "-c:a", "aac",
                 "-shortest",
-                "-movflags", "+faststart",
                 out
             )
+
         except RuntimeError as e:
             return await ctx.reply(f"❌ FFmpeg error:\n```{e}```")
 
-        await send_file(ctx, out, f"Music added (volume: {vol})")
-        vid_path.unlink(missing_ok=True)
-        aud_path.unlink(missing_ok=True)
+        await send_file(ctx, out, f"🎵 Music added (volume {vol})")
+
+        vid.unlink(missing_ok=True)
+        aud.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
 
 
-@bot.command(name="videohelp", help="Show all commands.")
+# ── help command ────────────────────────────────────
+
+@bot.command(name="videohelp")
 async def help_cmd(ctx):
-    embed = discord.Embed(title="🎬 Video Bot Commands", color=0x5865F2)
+
+    embed = discord.Embed(
+        title="🎬 Video Bot Commands",
+        color=0x5865F2
+    )
+
     embed.add_field(
-        name="✂️ `!trim <start> <end>`",
-        value="Trim a video. Attach video + give start/end in **seconds**.\n`!trim 5 30`",
+        name="✂️ !trim <start> <end>",
+        value="Trim a video.\nExample: `!trim 5 30`",
         inline=False
     )
+
     embed.add_field(
-        name="🔗 `!merge`",
-        value="Merge 2–5 videos into one. Attach all clips in **one message**.",
+        name="🔗 !merge",
+        value="Merge 2–5 videos.",
         inline=False
     )
+
     embed.add_field(
-        name="🎵 `!addmusic [volume]`",
-        value="Add music to a video. Attach **video first, then audio**.\nOptional volume 0.0–1.0 (default 0.5).\n`!addmusic 0.3`",
+        name="🎵 !addmusic [volume]",
+        value="Attach video then audio.\nExample: `!addmusic 0.3`",
         inline=False
     )
-    embed.set_footer(text="Max upload size: 25 MB per file (Discord limit)")
+
+    embed.set_footer(text="Files over 25MB automatically upload to Streamable")
+
     await ctx.reply(embed=embed)
 
 
-# ── startup ────────────────────────────────────────────────────────────────────
+# ── startup ─────────────────────────────────────────
 
 @bot.event
 async def on_ready():
+
     await tree.sync()
-    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
-    print("Commands ready: !trim  !merge  !addmusic  !videohelp")
+
+    print(f"Logged in as {bot.user}")
+    print("Commands ready: !trim !merge !addmusic !videohelp")
 
 
 bot.run(TOKEN)
