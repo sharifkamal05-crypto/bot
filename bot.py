@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-TOKEN = "YOUR_BOT_TOKEN_HERE"   # ← paste your token here
+TOKEN = "MTQ4MTM0MjMzMzI5NDIxNTM3Mw.Gn1TEN.u8WYtba_jWf2zrR2-3EE8veGua_Zl8WYot7DmY"   # ← paste your token here
 # ───────────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
